@@ -1,0 +1,14 @@
+# رابط کاربری
+gradio>=4.44.0
+
+# ارتباط با API دیپ‌سیک
+requests>=2.31.0
+
+# خواندن کلید API از فایل .env
+python-dotenv>=1.0.0
+
+# تبدیل PDF به Markdown (به همراه PyMuPDF به صورت خودکار نصب می‌شود)
+pymupdf4llm
+
+# تبدیل Word (docx) به Markdown
+mammoth>=1.8.0

@@ -1,0 +1,25 @@
+# وابستگی‌ها
+node_modules
+.pnp
+.pnp.js
+
+# خروجی build
+.next
+out
+build
+dist
+
+# Vercel
+.vercel
+
+# متغیرهای محیطی (کلید API را هرگز commit نکنید)
+.env
+.env*.local
+
+# سیستمی
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+next-env.d.ts
+*.tsbuildinfo

@@ -1,22 +1,23 @@
 /**
- * مسیر امن ارتباط با DeepSeek.
+ * مسیر امن ارتباط با DeepSeek (واسطه‌ی سمت سرور).
  *
- * چرا واسطه لازم است؟
- * ۱) کلید API روی سرور (Environment Variable) می‌ماند و هرگز به مرورگر نمی‌رود.
- * ۲) مرورگر نمی‌تواند مستقیم به api.deepseek.com درخواست بزند (CORS).
+ *  • کلید API فقط روی سرور می‌ماند — چه از پنل ثبت شده باشد، چه از متغیر محیطی.
+ *  • دسترسی فقط برای کاربر واردشده (کوکی نشست) مجاز است.
+ *  • اولویت کلید: کلید تأییدشده‌ی پنل، سپس DEEPSEEK_API_KEY.
+ *  • مرورگر نمی‌تواند مستقیم به api.deepseek.com درخواست بزند (CORS).
  *
- * متغیرهای محیطی لازم (روی Vercel: Settings → Environment Variables):
- *   DEEPSEEK_API_KEY  (اجباری)
- *   APP_PASSWORD      (اختیاری ولی توصیه‌شده؛ رمز دسترسی سایت)
- *   DEEPSEEK_BASE_URL (اختیاری)
- *   DEEPSEEK_MODEL    (اختیاری)
+ * متغیرهای محیطی (اختیاری، روی Vercel: Settings → Environment Variables):
+ *   DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
  */
+import { guard } from '../../../lib/http';
+import { resolveDeepseek, statusPayload } from '../../../lib/store';
+import { isKnownModel, safeModel } from '../../../lib/models';
+
 
 export const runtime = 'nodejs';
 // سقف زمان اجرا در Vercel (پلن Hobby حداکثر ۶۰ ثانیه)
 export const maxDuration = 60;
 
-const MODELS = ['deepseek-chat', 'deepseek-reasoner'];
 const MAX_TOTAL_CHARS = 400000; // محافظت از مصرف بی‌رویه
 const UPSTREAM_TIMEOUT_MS = 55000;
 
@@ -27,49 +28,41 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
-function env(name, fallback = '') {
-  return String(process.env[name] || fallback).trim();
-}
-
 /** ترجمه‌ی خطای دیپ‌سیک به پیام فارسی */
 function upstreamMessage(status, bodyText) {
   const detail = String(bodyText || '').slice(0, 300);
-  if (status === 401) return 'کلید API دیپ‌سیک نامعتبر است (خطای 401). مقدار DEEPSEEK_API_KEY را بررسی کنید.';
+  if (status === 401) return 'کلید API دیپ‌سیک نامعتبر است (خطای 401). در پنل کلید را دوباره ثبت و تست کنید.';
   if (status === 402) return 'اعتبار حساب دیپ‌سیک کافی نیست (خطای 402). حساب را شارژ کنید.';
   if (status === 400) return `درخواست نامعتبر بود (خطای 400): ${detail}`;
   if (status === 429) return 'محدودیت نرخ درخواست دیپ‌سیک (خطای 429). چند لحظه بعد دوباره تلاش کنید.';
   return `خطای دیپ‌سیک (${status}): ${detail}`;
 }
 
-/** وضعیت سرور برای نمایش در رابط کاربری */
-export async function GET() {
-  const apiKey = env('DEEPSEEK_API_KEY');
-  const model = env('DEEPSEEK_MODEL', 'deepseek-chat');
-  return jsonResponse({
-    ready: Boolean(apiKey),
-    needsPassword: Boolean(env('APP_PASSWORD')),
-    defaultModel: MODELS.includes(model) ? model : 'deepseek-chat',
-    models: MODELS,
-  });
+/** وضعیت سرویس برای نمایش در رابط کاربری (وضعیت کلید، مدل و محل ذخیره‌سازی) */
+export async function GET(request) {
+  const { state, error } = await guard(request);
+  if (error) return error;
+
+  const status = statusPayload(state);
+  return jsonResponse({ ...status, needsPassword: true, defaultModel: status.model });
 }
 
 export async function POST(request) {
-  const apiKey = env('DEEPSEEK_API_KEY');
-  if (!apiKey) {
+  const { state, error } = await guard(request);
+  if (error) return error;
+
+  const deepseek = resolveDeepseek(state);
+  if (!deepseek.ready) {
     return jsonResponse(
       {
         error:
-          'کلید DEEPSEEK_API_KEY روی سرور تنظیم نشده است. روی Vercel آن را در ' +
-          'Settings → Environment Variables وارد کنید و پروژه را دوباره دیپلوی کنید.',
+          'کلید API دیپ‌سیک فعال نیست. در «پنل ← تنظیمات دیپ‌سیک» کلید را وارد کنید، ' +
+          'دکمه‌ی «تست اتصال» را بزنید و بعد آن را فعال کنید.',
       },
-      500
+      503
     );
   }
-
-  const requiredPassword = env('APP_PASSWORD');
-  if (requiredPassword && String(request.headers.get('x-app-password') || '').trim() !== requiredPassword) {
-    return jsonResponse({ error: 'رمز دسترسی نادرست است.' }, 401);
-  }
+  const apiKey = deepseek.apiKey;
 
   let body = null;
   try {
@@ -92,9 +85,9 @@ export async function POST(request) {
   }
 
   const requested = String(body?.model || '').trim();
-  const model = MODELS.includes(requested) ? requested : env('DEEPSEEK_MODEL', 'deepseek-chat');
+  const model = isKnownModel(requested) ? requested : deepseek.model;
   const payload = {
-    model: MODELS.includes(model) ? model : 'deepseek-chat',
+    model: safeModel(model),
     messages,
     stream: false,
   };
@@ -105,7 +98,7 @@ export async function POST(request) {
     if (body?.jsonMode) payload.response_format = { type: 'json_object' };
   }
 
-  const baseUrl = env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com').replace(/\/+$/, '');
+  const baseUrl = deepseek.baseUrl;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 

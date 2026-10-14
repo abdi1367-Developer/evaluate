@@ -161,11 +161,64 @@ export function normalizeResult(data) {
     score,
     grade: asText(data?.grade) || gradeFromScore(score),
     criteria,
+    sections: normalizeSections(data?.sections),
     summary: asText(data?.summary),
     strengths: asList(data?.strengths),
     weaknesses: asList(data?.weaknesses),
     suggestions: asList(data?.suggestions),
     verdict: asText(data?.verdict),
+  };
+}
+
+export const SECTION_STATUS = {
+  ok: { label: 'موجود', mark: '✅' },
+  partial: { label: 'ناقص', mark: '⚠️' },
+  missing: { label: 'غایب', mark: '❌' },
+};
+
+/** آرایه‌ی «بخش‌های مورد انتظار» مدل را به شکل یکدست تبدیل می‌کند */
+export function normalizeSections(value) {
+  const list = Array.isArray(value) ? value : [];
+  return list
+    .map((item) => {
+      if (typeof item === 'string') {
+        const title = item.trim();
+        return title ? { title, status: 'partial', present: false, note: '' } : null;
+      }
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+      const title = asText(item.title) || asText(item.name);
+      if (!title) return null;
+
+      const rawStatus = asText(item.status);
+      const presence = item.present;
+      let status = 'partial';
+      if (/غایب|غايب|ندارد|نبود|موجود نیست|missing|absent/i.test(rawStatus)) status = 'missing';
+      else if (/ناقص|ضعیف|ضعيف|جزئی|جزئي|partial|incomplete/i.test(rawStatus)) status = 'partial';
+      else if (/موجود|دارد|هست|بله|ok|complete|present|yes/i.test(rawStatus)) status = 'ok';
+      else if (presence === true || presence === 1) status = 'ok';
+      else if (presence === false || presence === 0) status = 'missing';
+      else if (typeof presence === 'string') {
+        status = /^(true|yes|بله|1)$/i.test(presence.trim()) ? 'ok' : 'missing';
+      }
+
+      return {
+        title,
+        status,
+        present: status === 'ok',
+        note: asText(item.note) || asText(item.comment) || asText(item.description),
+      };
+    })
+    .filter(Boolean);
+}
+
+/** شمارش وضعیت بخش‌های مورد انتظار */
+export function sectionSummary(sections) {
+  const list = Array.isArray(sections) ? sections : [];
+  return {
+    total: list.length,
+    ok: list.filter((item) => item.status === 'ok').length,
+    partial: list.filter((item) => item.status === 'partial').length,
+    missing: list.filter((item) => item.status === 'missing').length,
   };
 }
 
@@ -203,6 +256,23 @@ export function reportToMarkdown(result, meta = {}) {
       const comment = String(item.comment || '').replace(/\|/g, '/').replace(/\n+/g, ' ');
       lines.push(`| ${item.name} | ${value} | ${comment} |`);
     }
+    lines.push('');
+  }
+
+  if (result?.sections?.length) {
+    lines.push('## 🧩 بخش‌های مورد انتظار');
+    lines.push('| بخش | وضعیت | توضیح |');
+    lines.push('| --- | :---: | --- |');
+    for (const item of result.sections) {
+      const tone = SECTION_STATUS[item.status] || SECTION_STATUS.partial;
+      const note = String(item.note || '').replace(/\|/g, '/').replace(/\n+/g, ' ');
+      lines.push(`| ${item.title} | ${tone.mark} ${tone.label} | ${note} |`);
+    }
+    const counts = sectionSummary(result.sections);
+    lines.push('');
+    lines.push(
+      `جمع: ${counts.total} مورد — موجود: ${counts.ok}، ناقص: ${counts.partial}، غایب: ${counts.missing}`
+    );
     lines.push('');
   }
 

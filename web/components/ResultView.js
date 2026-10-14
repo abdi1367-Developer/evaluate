@@ -1,6 +1,6 @@
 'use client';
 
-import { scoreTone } from '../lib/result';
+import { SECTION_STATUS, scoreTone, sectionSummary } from '../lib/result';
 
 const fa = (value) => Number(value || 0).toLocaleString('fa-IR');
 
@@ -45,6 +45,7 @@ function CriterionRow({ item }) {
 export default function ResultView({ analysis, onDownload, onCopyJson, copyLabel }) {
   if (!analysis?.result) return null;
   const { result, model, modeLabel, originalChars, judgeChars, chunkCount } = analysis;
+  const sectionCounts = sectionSummary(result.sections);
 
   return (
     <div>
@@ -82,6 +83,36 @@ export default function ResultView({ analysis, onDownload, onCopyJson, copyLabel
         <div className="box" style={{ marginBottom: 16 }}>
           <h4>📝 چکیده</h4>
           <p style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: 14 }}>{result.summary}</p>
+        </div>
+      ) : null}
+
+      {result.sections?.length ? (
+        <div className="box" style={{ marginBottom: 16 }}>
+          <h4>
+            🧩 بخش‌های مورد انتظار
+            <span className="muted" style={{ fontSize: 13, fontWeight: 400 }}>
+              {' '}
+              — موجود: {fa(sectionCounts.ok)} / ناقص: {fa(sectionCounts.partial)} / غایب: {fa(sectionCounts.missing)}
+            </span>
+          </h4>
+          <div className="checks checks--result">
+            {result.sections.map((item, index) => {
+              const tone = SECTION_STATUS[item.status] || SECTION_STATUS.partial;
+              return (
+                <div key={`${item.title}-${index}`} className={`sect sect--${item.status}`}>
+                  <div className="sect__head">
+                    <b>
+                      {tone.mark} {item.title}
+                    </b>
+                    <span className={`badge badge--${item.status === 'ok' ? 'ok' : item.status === 'missing' ? 'err' : 'warn'}`}>
+                      {tone.label}
+                    </span>
+                  </div>
+                  {item.note ? <p className="muted">{item.note}</p> : null}
+                </div>
+              );
+            })}
+          </div>
         </div>
       ) : null}
 

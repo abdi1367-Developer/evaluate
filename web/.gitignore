@@ -16,6 +16,9 @@ dist
 .env
 .env*.local
 
+# داده‌های محلی برنامه (حساب کاربری و تنظیمات پنل)
+.data
+
 # سیستمی
 .DS_Store
 Thumbs.db

@@ -1,16 +1,23 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { ACCEPT_ATTRIBUTE, MAX_FILE_MB, parseDocument } from '../lib/parse';
 import { extractHeadings } from '../lib/headings';
-import { DEFAULT_MAX_DIRECT_CHARS, textStats } from '../lib/text';
-import { MODELS, checkServer, runAnalysis } from '../lib/deepseek-client';
+import { DEFAULT_MAX_DIRECT_CHARS, normalizeMarkdown, textStats } from '../lib/text';
+import { MODELS, runAnalysis, structureToMarkdown } from '../lib/deepseek-client';
 import { reportToMarkdown } from '../lib/result';
+import { convertWithFile, convertWithUrl, fetchSessionQuiet, logout as logoutRequest } from '../lib/api-client';
+import { defaultGroupsFor, defaultSelection, guessDocType, selectedInOrder } from '../lib/sections';
 import OutlineView from '../components/OutlineView';
 import ResultView from '../components/ResultView';
+import ExpectedSections from '../components/ExpectedSections';
 
 const fa = (value) => Number(value || 0).toLocaleString('fa-IR');
 const megabytes = (bytes) => `${(Number(bytes || 0) / 1024 / 1024).toFixed(2)} MB`;
+
+const MAX_ONLINE_FILE_MB = 4;
 
 const MAX_CHARS_OPTIONS = [
   { value: 30000, label: '۳۰٬۰۰۰ کاراکتر — کم‌هزینه' },
@@ -18,10 +25,30 @@ const MAX_CHARS_OPTIONS = [
   { value: 100000, label: '۱۰۰٬۰۰۰ کاراکتر — دقیق‌تر' },
 ];
 
+const CONVERT_MODES = [
+  { value: 'smart', label: 'هوشمند (پیشنهادی): اول آنلاین، در صورت نبود امکان محلی' },
+  { value: 'local', label: 'فقط محلی: تبدیل داخل مرورگر (فایل به هیچ سروری نمی‌رود)' },
+  { value: 'online', label: 'فقط آنلاین: با سرویس‌های ابری (Jina / Marker / Mistral)' },
+];
+
+const PROVIDER_LABELS = {
+  local: 'تبدیل محلی در مرورگر',
+  jina: 'Jina Reader (آنلاین، رایگان)',
+  marker: 'Datalab Marker (آنلاین)',
+  mistral: 'Mistral OCR (آنلاین)',
+};
+
+const providerLabel = (id) => PROVIDER_LABELS[id] || id || 'نامشخص';
+
+
 export default function Home() {
-  const [server, setServer] = useState(null);
-  const [password, setPassword] = useState('');
+  const router = useRouter();
+  const [session, setSession] = useState(null);
+  const [ready, setReady] = useState(false);
   const [file, setFile] = useState(null);
+  const [sourceUrl, setSourceUrl] = useState('');
+  const [convertMode, setConvertMode] = useState('smart');
+  const [structureWithAI, setStructureWithAI] = useState(true);
   const [dragging, setDragging] = useState(false);
   const [converting, setConverting] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -37,26 +64,74 @@ export default function Home() {
   const [logs, setLogs] = useState([]);
   const [analysis, setAnalysis] = useState(null);
   const [copyLabel, setCopyLabel] = useState('کپی پاسخ خام مدل');
+  const [docType, setDocType] = useState('article');
+  const [sectionsSelection, setSectionsSelection] = useState([]);
+  const [conversion, setConversion] = useState(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
     let alive = true;
-    checkServer().then((info) => {
+    fetchSessionQuiet().then((data) => {
       if (!alive) return;
-      setServer(info);
-      if (info?.defaultModel) setModel(info.defaultModel);
+      if (!data?.authenticated) {
+        router.replace('/login');
+        return;
+      }
+      setSession(data);
+      const statusModel = data?.status?.model;
+      if (statusModel && MODELS.some((item) => item.id === statusModel)) setModel(statusModel);
+      const converter = data?.settings?.converter;
+      if (converter?.mode) setConvertMode(converter.mode);
+      if (converter) setStructureWithAI(converter.structureWithAI !== false);
+      setReady(true);
     });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [router]);
+
+  const groups = useMemo(() => {
+    const map = session?.settings?.expectedSections;
+    return (map && map[docType]) || defaultGroupsFor(docType);
+  }, [session, docType]);
+
+  const status = session?.status || null;
+  const deepseekReady = Boolean(status?.ready);
+  const storageIsTemp = Boolean(status && status.persistent === false);
 
   const stats = useMemo(() => textStats(markdown, headings), [markdown, headings]);
-  const title = doc?.meta?.name || file?.name || '';
+  const title = doc?.meta?.name || file?.name || sourceUrl || '';
   const willSummarize = stats.chars > maxDirectChars;
   const estimatedCalls = willSummarize
     ? Math.min(10, Math.ceil(stats.chars / Math.max(1000, maxDirectChars * 0.6))) + 1
     : 1;
+
+  const selectedSections = useMemo(
+    () => selectedInOrder(groups, sectionsSelection),
+    [groups, sectionsSelection]
+  );
+
+  const applyDocType = (nextType) => {
+    const map = session?.settings?.expectedSections;
+    const nextGroups = (map && map[nextType]) || defaultGroupsFor(nextType);
+    setDocType(nextType);
+    setSectionsSelection(defaultSelection(nextGroups));
+  };
+
+  const toggleSection = (title) => {
+    setSectionsSelection((previous) =>
+      previous.includes(title) ? previous.filter((item) => item !== title) : [...previous, title]
+    );
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutRequest();
+    } catch {
+      // کوکی در هر صورت پاک می‌شود
+    }
+    router.replace('/login');
+  };
 
   const resetDoc = () => {
     setDoc(null);
@@ -80,26 +155,111 @@ export default function Home() {
   };
 
   const handleConvert = async () => {
-    if (!file) {
-      setError('اول یک فایل PDF یا Word انتخاب کنید.');
+    const url = sourceUrl.trim();
+    if (!file && !url) {
+      setError('یک فایل PDF/Word انتخاب کنید یا لینک مقاله/کتاب را وارد کنید.');
       return;
     }
+
     setConverting(true);
     setError('');
-    setNotice('در حال تبدیل فایل …');
+    setNotice('شروع تبدیل …');
     setAnalysis(null);
+    setConversion(null);
     setLogs([]);
+
+    const converterSettings = session?.settings?.converter || {};
+    const hasCloudKey = Boolean(converterSettings.hasMarkerKey || converterSettings.hasMistralKey);
+    const onlineAllowed = convertMode !== 'local';
+    const notes = [];
+
     try {
-      const parsed = await parseDocument(file, {
-        onProgress: (message) => setNotice(message),
+      let markdown = '';
+      let provider = 'local';
+      let parsedLocal = null;
+
+      // ۱) تبدیل آنلاین از روی لینک (Jina Reader — رایگان و بدون کلید)
+      if (onlineAllowed && url) {
+        try {
+          setNotice('تبدیل آنلاین لینک با Jina Reader …');
+          const remote = await convertWithUrl({ url, provider: 'jina' });
+          markdown = remote.markdown;
+          provider = remote.provider || 'jina';
+          if (remote.notes?.length) notes.push(...remote.notes);
+        } catch (remoteError) {
+          notes.push(`تبدیل آنلاین لینک: ${remoteError.message}`);
+        }
+      }
+
+      // ۲) فایل: اگر کلید سرویس ابری ثبت شده باشد اول آنلاین، در غیر این صورت محلی
+      if (!markdown && file) {
+        const canUpload = onlineAllowed && hasCloudKey && file.size <= MAX_ONLINE_FILE_MB * 1024 * 1024;
+        if (canUpload) {
+          try {
+            setNotice('ارسال فایل به سرویس تبدیل آنلاین …');
+            const form = new FormData();
+            form.append('file', file);
+            const remote = await convertWithFile(form);
+            markdown = remote.markdown;
+            provider = remote.provider || 'online';
+            if (remote.notes?.length) notes.push(...remote.notes);
+          } catch (remoteError) {
+            notes.push(`تبدیل آنلاین فایل: ${remoteError.message}`);
+          }
+        }
+
+        if (!markdown) {
+          setNotice(`تبدیل محلی «${file.name}» در مرورگر …`);
+          parsedLocal = await parseDocument(file, { onProgress: (message) => setNotice(message) });
+          markdown = parsedLocal.markdown;
+          provider = 'local';
+          if (parsedLocal.notes?.length) notes.push(...parsedLocal.notes);
+        }
+      }
+
+      if (!markdown.trim()) {
+        throw new Error('متنی از منبع انتخاب‌شده به دست نیامد.');
+      }
+
+      // ۳) ساختاردهی Markdown با دیپ‌سیک (اختیاری)
+      if (structureWithAI && deepseekReady && markdown.length > 300) {
+        try {
+          const structured = await structureToMarkdown({
+            text: markdown,
+            title: file?.name || url || '',
+            model,
+            onProgress: (message) => setNotice(message),
+          });
+          if (structured?.markdown) markdown = structured.markdown;
+        } catch (structureError) {
+          notes.push(`ساختاردهی با دیپ‌سیک: ${structureError.message}`);
+        }
+      }
+
+      const finalMarkdown = normalizeMarkdown(markdown);
+      const finalHeadings = extractHeadings(finalMarkdown);
+      const finalStats = textStats(finalMarkdown, finalHeadings);
+
+      setDoc({
+        markdown: finalMarkdown,
+        headings: finalHeadings,
+        stats: finalStats,
+        notes,
+        pageCount: parsedLocal?.pageCount || null,
+        meta: parsedLocal?.meta || {
+          name: file?.name || url || 'منبع آنلاین',
+          size: file?.size || 0,
+          extension: file ? String(file.name).split('.').pop().toLowerCase() : 'url',
+        },
       });
-      setDoc(parsed);
-      setMarkdown(parsed.markdown);
-      setHeadings(parsed.headings);
+      setMarkdown(finalMarkdown);
+      setHeadings(finalHeadings);
+      setConversion({ provider, notes });
+      applyDocType(guessDocType(finalMarkdown, file?.name || url));
       setTab('outline');
       setNotice(
-        `تبدیل انجام شد: ${fa(parsed.stats.chars)} کاراکتر، ${fa(parsed.stats.words)} واژه و ` +
-          `${fa(parsed.headings.length)} سرفصل شناسایی شد.`
+        `تبدیل انجام شد (${providerLabel(provider)}): ${fa(finalStats.chars)} کاراکتر و ` +
+          `${fa(finalHeadings.length)} سرفصل شناسایی شد.`
       );
     } catch (conversionError) {
       setError(conversionError?.message || 'تبدیل فایل ناموفق بود.');
@@ -120,12 +280,21 @@ export default function Home() {
       setError('متنی برای تحلیل وجود ندارد؛ اول فایل را تبدیل کنید.');
       return;
     }
+    if (!deepseekReady) {
+      setError('کلید دیپ‌سیک فعال نیست؛ در «پنل ← تنظیمات دیپ‌سیک» کلید را ثبت کنید و دکمه‌ی تست را بزنید.');
+      return;
+    }
     setAnalyzing(true);
     setError('');
     setNotice('');
     setAnalysis(null);
     setCopyLabel('کپی پاسخ خام مدل');
-    setLogs([`شروع تحلیل با مدل «${model}» …`]);
+    setLogs([
+      `شروع تحلیل با مدل «${model}» …`,
+      selectedSections.length
+        ? `${selectedSections.length} سرفصل مورد انتظار برای بررسی انتخاب شده است.`
+        : 'هیچ سرفصل مورد انتظاری انتخاب نشده است.',
+    ]);
     setTab('result');
 
     try {
@@ -136,7 +305,7 @@ export default function Home() {
         model,
         maxDirectChars,
         extraNote,
-        password,
+        expectedSections: selectedSections,
         onProgress: (message) => setLogs((previous) => [...previous, message]),
       });
       setAnalysis(outcome);
@@ -185,6 +354,16 @@ export default function Home() {
 
   const busy = converting || analyzing;
 
+  if (!ready) {
+    return (
+      <main className="page">
+        <section className="card">
+          <p className="card__hint">⏳ در حال بررسی نشست کاربری …</p>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="page">
       <header className="header">
@@ -193,30 +372,51 @@ export default function Home() {
           <p>
             PDF/Word ← Markdown ← فهرست سرفصل‌ها ← تحلیل و نمره‌دهی با DeepSeek.
             <br />
-            فایل شما به هیچ سروری آپلود نمی‌شود؛ تبدیل داخل مرورگر انجام می‌شود و فقط متن استخراج‌شده به مدل می‌رود.
+            تبدیل فایل داخل مرورگر انجام می‌شود (یا با سرویس‌های آنلاین) و فقط متن استخراج‌شده به مدل می‌رود.
           </p>
         </div>
-        <div className="badges">
-          <span className="badge badge--ok">⚡ آماده‌ی دیپلوی روی Vercel</span>
-          {server === null ? <span className="badge">⏳ بررسی سرور …</span> : null}
-          {server && server.ready ? <span className="badge badge--ok">🔑 کلید API تنظیم شده</span> : null}
-          {server && server.ready === false ? (
-            <span className="badge badge--err">⛔ کلید API تنظیم نشده</span>
-          ) : null}
-          {server && server.needsPassword ? (
-            <span className="badge badge--ok">🔒 رمز دسترسی فعال</span>
-          ) : null}
-          {server && server.ready && !server.needsPassword ? (
-            <span className="badge badge--warn">🔓 بدون رمز دسترسی</span>
-          ) : null}
+        <div className="header__side">
+          <div className="badges">
+            {deepseekReady ? (
+              <span className="badge badge--ok">🔑 کلید دیپ‌سیک فعال</span>
+            ) : (
+              <span className="badge badge--err">⛔ کلید دیپ‌سیک فعال نیست</span>
+            )}
+            {status?.source ? (
+              <span className="badge">
+                {status.source === 'env'
+                  ? 'کلید از متغیر محیطی'
+                  : status.source === 'panel'
+                    ? 'کلید ثبت‌شده در پنل'
+                    : 'کلید تأییدنشده'}
+              </span>
+            ) : null}
+            {storageIsTemp ? (
+              <span className="badge badge--warn">⚠️ ذخیره‌سازی موقت</span>
+            ) : null}
+            {session?.account ? (
+              <span className="badge">
+                👤 {session.account.username} — {session.account.mobileMasked}
+              </span>
+            ) : null}
+          </div>
+          <div className="actions" style={{ marginTop: 8 }}>
+            <Link className="btn btn--ghost btn--sm" href="/panel">
+              ⚙️ پنل و تنظیمات
+            </Link>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={handleLogout}>
+              🚪 خروج
+            </button>
+          </div>
         </div>
       </header>
 
       <section className="card">
         <div className="card__head">
-          <h2>۱) فایل مقاله / کتاب</h2>
+          <h2>۱) منبع مقاله / کتاب</h2>
           <p className="card__hint">
-            فرمت‌های مجاز: PDF ، DOCX ، MD ، TXT — حداکثر {MAX_FILE_MB} مگابایت
+            فایل PDF/DOCX/MD/TXT (تا {MAX_FILE_MB} مگابایت) یا لینک مقاله‌ی آنلاین — تبدیل در مرورگر یا با
+            سرویس‌های ابری انجام می‌شود.
           </p>
         </div>
 
@@ -255,26 +455,70 @@ export default function Home() {
           </div>
         ) : null}
 
+        <div className="settings" style={{ marginTop: 16 }}>
+          <div className="field">
+            <label htmlFor="sourceUrl">لینک مقاله/کتاب آنلاین (اختیاری)</label>
+            <input
+              id="sourceUrl"
+              className="input"
+              value={sourceUrl}
+              onChange={(event) => setSourceUrl(event.target.value)}
+              placeholder="https://example.com/paper.pdf"
+              disabled={busy}
+              dir="ltr"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="convertMode">روش تبدیل</label>
+            <select
+              id="convertMode"
+              className="select"
+              value={convertMode}
+              onChange={(event) => setConvertMode(event.target.value)}
+              disabled={busy}
+            >
+              {CONVERT_MODES.map((mode) => (
+                <option key={mode.value} value={mode.value}>
+                  {mode.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>ساختاردهی Markdown با دیپ‌سیک</label>
+            <label className="check check--wide">
+              <input
+                type="checkbox"
+                checked={structureWithAI}
+                onChange={(event) => setStructureWithAI(event.target.checked)}
+                disabled={busy || !deepseekReady}
+              />
+              <span>سرفصل‌ها و جدول‌ها مرتب شوند (توکن بیشتری مصرف می‌کند)</span>
+            </label>
+          </div>
+        </div>
+
         <div className="actions">
           <button
             type="button"
             className="btn btn--primary"
             onClick={handleConvert}
-            disabled={busy || !file}
+            disabled={busy || (!file && !sourceUrl.trim())}
           >
             {converting ? '⏳ در حال تبدیل و استخراج سرفصل …' : '۱) تبدیل به Markdown و استخراج سرفصل'}
           </button>
-          {file ? (
+          {file || sourceUrl ? (
             <button
               type="button"
               className="btn btn--ghost btn--sm"
               disabled={busy}
               onClick={() => {
                 setFile(null);
+                setSourceUrl('');
                 resetDoc();
               }}
             >
-              پاک کردن فایل
+              پاک کردن منبع
             </button>
           ) : null}
         </div>
@@ -291,9 +535,21 @@ export default function Home() {
       </section>
 
       {doc || markdown ? (
+        <ExpectedSections
+          docType={docType}
+          groups={groups}
+          selection={sectionsSelection}
+          disabled={busy}
+          onDocTypeChange={applyDocType}
+          onToggle={toggleSection}
+          onSetSelection={setSectionsSelection}
+        />
+      ) : null}
+
+      {doc || markdown ? (
         <section className="card">
           <div className="card__head">
-            <h2>۲) نتیجه‌ی تبدیل</h2>
+            <h2>۳) نتیجه‌ی تبدیل</h2>
             <div className="actions" style={{ marginTop: 0 }}>
               <button
                 type="button"
@@ -394,11 +650,13 @@ export default function Home() {
 
       <section className="card">
         <div className="card__head">
-          <h2>۳) تحلیل با DeepSeek</h2>
+          <h2>۴) تحلیل با DeepSeek</h2>
           <p className="card__hint">
-            {willSummarize
-              ? `متن بلند است (${fa(stats.chars)} کاراکتر) → حدود ${fa(estimatedCalls)} درخواست به دیپ‌سیک`
-              : 'متن کوتاه است و یک‌جا داوری می‌شود'}
+            {deepseekReady
+              ? willSummarize
+                ? `متن بلند است (${fa(stats.chars)} کاراکتر) → حدود ${fa(estimatedCalls)} درخواست به دیپ‌سیک`
+                : 'متن کوتاه است و یک‌جا داوری می‌شود'
+              : 'کلید دیپ‌سیک فعال نیست؛ برای شروع، در پنل کلید را ثبت و تست کنید.'}
           </p>
         </div>
 
@@ -438,23 +696,6 @@ export default function Home() {
           </div>
 
           <div className="field">
-            <label htmlFor="password">
-              رمز دسترسی {server?.needsPassword ? '(لازم است)' : '(اختیاری)'}
-            </label>
-            <input
-              id="password"
-              className="input"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder={
-                server?.needsPassword ? 'رمز تعیین‌شده روی سرور' : 'اگر سرور رمز ندارد، خالی بگذارید'
-              }
-              disabled={busy}
-            />
-          </div>
-
-          <div className="field">
             <label htmlFor="note">تأکید/نکته‌ی خاص برای داور (اختیاری)</label>
             <input
               id="note"
@@ -474,7 +715,7 @@ export default function Home() {
             onClick={handleAnalyze}
             disabled={busy || !markdown.trim()}
           >
-            {analyzing ? '⏳ در حال تحلیل و نمره‌دهی …' : '۲) تحلیل با DeepSeek و گرفتن نمره'}
+            {analyzing ? '⏳ در حال تحلیل و نمره‌دهی …' : 'تحلیل با DeepSeek و گرفتن نمره'}
           </button>
           {analysis ? (
             <span className="badge badge--ok">
@@ -483,11 +724,11 @@ export default function Home() {
           ) : null}
         </div>
 
-        {server && server.ready === false ? (
-          <div className="alert alert--error">
-            کلید API روی سرور تنظیم نشده است.{server.error ? ` (${server.error})` : ''} روی Vercel در
-            Settings ← Environment Variables متغیر <b>DEEPSEEK_API_KEY</b> را وارد کنید و پروژه را
-            دوباره دیپلوی کنید (و برای اجرای محلی در فایل <b>.env.local</b> بگذارید).
+        {!deepseekReady ? (
+          <div className="alert alert--warn">
+            برای تحلیل، کلید دیپ‌سیک باید فعال باشد. به <Link href="/panel">پنل و تنظیمات</Link> بروید و در بخش
+            «تنظیمات دیپ‌سیک» کلید را وارد کنید، دکمه‌ی «تست اتصال» را بزنید و سپس آن را فعال کنید. (اگر روی
+            Vercel متغیر <b>DEEPSEEK_API_KEY</b> را تنظیم کرده باشید، به‌صورت خودکار فعال است.)
           </div>
         ) : null}
 

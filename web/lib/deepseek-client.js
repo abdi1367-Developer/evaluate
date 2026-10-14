@@ -11,22 +11,24 @@ import {
   DEFAULT_MAX_DIRECT_CHARS,
   buildCondensedDocument,
   estimateTokens,
+  normalizeMarkdown,
   outlineToText,
   splitIntoChunks,
   truncateForDirect,
 } from './text';
 import {
   buildEvaluatorUserPrompt,
+  buildStructureUserPrompt,
   buildSummaryUserPrompt,
   evaluatorMessages,
+  structureMessages,
   summaryMessages,
 } from './prompts';
 import { normalizeResult, parseJsonResponse } from './result';
+import { sectionsPromptText } from './sections';
+import { MODELS } from './models';
 
-export const MODELS = [
-  { id: 'deepseek-chat', label: 'deepseek-chat — سریع و کم‌هزینه (پیشنهادی)' },
-  { id: 'deepseek-reasoner', label: 'deepseek-reasoner — استدلال عمیق‌تر (کندتر و گران‌تر)' },
-];
+export { MODELS };
 
 const RETRYABLE_STATUS = [429, 500, 502, 503, 504];
 const MAX_RETRIES = 2;
@@ -36,26 +38,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** وضعیت سرور: آیا کلید API تنظیم شده و آیا رمز دسترسی لازم است؟ */
-export async function checkServer() {
-  try {
-    const response = await fetch('/api/deepseek', { method: 'GET', cache: 'no-store' });
-    if (!response.ok) return { ready: false, error: `سرور پاسخ ${response.status} داد.` };
-    return await response.json();
-  } catch (error) {
-    return { ready: false, error: error?.message || 'ارتباط با سرور برقرار نشد.' };
-  }
-}
-
 /** یک درخواست چت به مسیر سرور می‌فرستد (با تلاش دوباره در خطاهای موقت) */
-export async function callChat({ messages, model, jsonMode = false, password = '', onWait }) {
+export async function callChat({ messages, model, jsonMode = false, onWait }) {
   let lastError = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     try {
       const response = await fetch('/api/deepseek', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-app-password': password || '' },
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages, model, jsonMode }),
       });
       const data = await response.json().catch(() => null);
@@ -101,7 +93,7 @@ export async function runAnalysis(options) {
     chunkChars = DEFAULT_CHUNK_CHARS,
     maxChunks = DEFAULT_MAX_CHUNKS,
     extraNote = '',
-    password = '',
+    expectedSections = [],
     onProgress = () => {},
   } = options;
 
@@ -153,7 +145,6 @@ export async function runAnalysis(options) {
           })
         ),
         model,
-        password,
         onWait: onProgress,
       });
       summaries.push({ title: label, summary });
@@ -178,6 +169,7 @@ export async function runAnalysis(options) {
       buildEvaluatorUserPrompt({
         content: judgeContent,
         outlineText,
+        expectedSections: sectionsPromptText(expectedSections),
         docTitle: title,
         modeNote: modeLabel,
         extraNote,
@@ -186,7 +178,6 @@ export async function runAnalysis(options) {
     ),
     model,
     jsonMode: true,
-    password,
     onWait: onProgress,
   });
 
@@ -198,9 +189,58 @@ export async function runAnalysis(options) {
     modeLabel,
     truncated,
     summaries,
+    expectedSections: Array.isArray(expectedSections) ? expectedSections : [],
     chunkCount: summaries.length,
     originalChars: chars,
     judgeChars: judgeContent.length,
   };
+}
+
+/** اگر مدل خروجی را داخل بلوک کد گذاشته باشد، پاکش می‌کند */
+function stripCodeFence(text) {
+  const clean = String(text || '').trim();
+  const fenced = clean.match(/^```(?:markdown|md)?\s*([\s\S]*?)```$/);
+  return (fenced ? fenced[1] : clean).trim();
+}
+
+/**
+ * متن استخراج‌شده را با دیپ‌سیک به Markdown تمیز و ساختاریافته تبدیل می‌کند
+ * (مرحله‌ی اختیاری؛ وقتی تبدیل محلی سرفصل‌ها را خوب تشخیص نداده باشد مفید است).
+ */
+export async function structureToMarkdown({
+  text,
+  title = '',
+  model = 'deepseek-chat',
+  chunkChars = 14000,
+  maxChunks = 10,
+  onProgress = () => {},
+}) {
+  const source = String(text || '').trim();
+  if (!source) throw new Error('متنی برای ساختاردهی وجود ندارد.');
+
+  const chunks = splitIntoChunks(source, chunkChars, maxChunks);
+  if (!chunks.length) throw new Error('تقسیم متن برای ساختاردهی ناموفق بود.');
+
+  const parts = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    onProgress(`ساختاردهی Markdown با دیپ‌سیک — بخش ${index + 1} از ${chunks.length} …`);
+    const answer = await callChat({
+      messages: structureMessages(
+        buildStructureUserPrompt({
+          text: chunks[index],
+          index: index + 1,
+          total: chunks.length,
+          title,
+        })
+      ),
+      model,
+      onWait: onProgress,
+    });
+    parts.push(stripCodeFence(answer));
+  }
+
+  const markdown = normalizeMarkdown(parts.join('\n\n'));
+  if (!markdown.trim()) throw new Error('دیپ‌سیک خروجی Markdown نداد.');
+  return { markdown, chunks: chunks.length };
 }
 
